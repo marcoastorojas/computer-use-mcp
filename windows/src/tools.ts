@@ -335,8 +335,9 @@ export class Tools {
     return ToolResult.ok(`${res.text}, but no window appeared yet; check list_apps in a moment`);
   }
 
-  private hideCursor(): ToolResult {
-    return ToolResult.ok("no floating cursor is drawn on Windows; nothing to hide");
+  private async hideCursor(): Promise<ToolResult> {
+    const res = await this.worker.call<{ shown: boolean }>("hide_cursor", {});
+    return ToolResult.ok(res.shown ? "cursor hidden" : "the cursor was not showing");
   }
 
   // MARK: session
@@ -535,7 +536,8 @@ export class Tools {
   }
 
   private async act(s: Session, win: Win, op: string, payload: JSONObj): Promise<ToolResult> {
-    const res = await this.worker.call<ActionResult>(op, payload);
+    const cursorIdleMs = ConfigStore.shared.load().phantomCursorIdleMs;
+    const res = await this.worker.call<ActionResult>(op, { ...payload, cursorIdleMs });
     let r: ToolResult;
     if (res.status === "unsupported") r = ToolResult.unsupported(res.text);
     else if (res.status === "ineffective") r = ToolResult.ineffective(res.text);

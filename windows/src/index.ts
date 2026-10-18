@@ -53,7 +53,12 @@ const toolList: JSONObj[] = [
   tool("list_apps", "List running apps with name, pid, exe and whether each one is allowed.", {}, []),
   tool("list_windows", "List the windows of an app with their window_id, title and size.", {}),
   tool("open_app", "Launch an app (or reopen its window) without bringing it to the front.", {}),
-  tool("hide_cursor", "No-op on Windows (no floating cursor is drawn). Provided for parity with the macOS backend.", {}, []),
+  tool(
+    "hide_cursor",
+    "Dismiss the floating agent cursor. It stays visible across the whole task; call this once when the task is finished so it does not linger on screen.",
+    {},
+    []
+  ),
   tool(
     "screenshot",
     "Capture ONE window of an app (works even when it is covered by other windows) and list its actionable elements as numbered [N] lines with kind, name and center position. Positions and all later coordinates are window pixels in the reported frame, whatever the image scale. Without window_id it captures the app's active (or first) window.",
@@ -158,6 +163,7 @@ Loop: screenshot(app) -> act with element_index (preferred) or coordinate -> scr
 Coordinates are always window pixels in the frame reported by the last screenshot, whatever the image scale. \
 Every action result starts with ok, unsupported(reason and what to use instead), ineffective(...) or error. \
 Use menu for menu-bar commands and batch to chain steps in one call. \
+A floating cursor follows your actions and stays visible for the whole task; call hide_cursor once when the task is finished. \
 Some apps ignore background input, GPU-drawn windows can capture blank (the element list still works), and drags are the least reliable: verify with a screenshot. \
 Password fields and apps outside the allowed list are refused: ask the user instead of working around it.`;
 

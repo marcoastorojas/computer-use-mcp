@@ -119,12 +119,13 @@ async function main() {
       const times = indexOf(s, 'button "(Multiplicar por|Multiply by)"');
       const eight = indexOf(s, 'button "(Ocho|Eight)"');
       const equals = indexOf(s, 'button "(Es igual a|Equals)"');
-      if (!seven || !times || !eight || !equals) check(false, "found the Calculator buttons");
+      const clear = indexOf(s, 'button "(Borrar|Clear)"');
+      if (!seven || !times || !eight || !equals || !clear) check(false, "found the Calculator buttons");
       else {
         const r = await callTool("batch", {
           app: appArg,
           actions: [
-            { action: "key", keys: "escape" },
+            { action: "click", element_index: clear },
             { action: "click", element_index: seven },
             { action: "click", element_index: times },
             { action: "click", element_index: eight },

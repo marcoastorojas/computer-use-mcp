@@ -75,13 +75,15 @@ namespace ComputerUse
         [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, uint m, out int w, out int l);
         [DllImport("user32.dll")] public static extern IntPtr SendMessageTimeout(IntPtr h, uint m, IntPtr w, IntPtr l, uint flags, uint timeout, out IntPtr result);
         [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+        [DllImport("user32.dll")] public static extern bool IsGUIThread(bool convert);
         [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h, uint flags);
         [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT p);
         [DllImport("user32.dll")] public static extern IntPtr ChildWindowFromPointEx(IntPtr parent, POINT p, uint flags);
         [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")] static extern IntPtr GetWindowLongPtr64(IntPtr h, int i);
         [DllImport("user32.dll", EntryPoint = "GetWindowLongW")] static extern int GetWindowLong32(IntPtr h, int i);
         [DllImport("user32.dll")] public static extern bool GetGUIThreadInfo(uint tid, ref GUITHREADINFO info);
-        [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool attach);
+        [DllImport("user32.dll", SetLastError = true)] public static extern bool AttachThreadInput(uint a, uint b, bool attach);
         [DllImport("user32.dll")] public static extern bool GetKeyboardState(byte[] s);
         [DllImport("user32.dll")] public static extern bool SetKeyboardState(byte[] s);
         [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
@@ -138,6 +140,20 @@ namespace ComputerUse
         public const uint SMTO_ABORTIFHUNG = 2;
         public const int VK_SHIFT = 0x10, VK_CONTROL = 0x11, VK_MENU = 0x12, VK_LWIN = 0x5B;
         public const int VK_LSHIFT = 0xA0, VK_LCONTROL = 0xA2, VK_LMENU = 0xA4;
+
+        // Phantom cursor (layered window)
+        [StructLayout(LayoutKind.Sequential)] public struct SIZE { public int cx, cy; }
+        [StructLayout(LayoutKind.Sequential, Pack = 1)] public struct BLENDFUNCTION { public byte BlendOp, BlendFlags, SourceConstantAlpha, AlphaFormat; }
+        [DllImport("user32.dll")] public static extern IntPtr GetDC(IntPtr h);
+        [DllImport("user32.dll")] public static extern int ReleaseDC(IntPtr h, IntPtr dc);
+        [DllImport("gdi32.dll")] public static extern IntPtr CreateCompatibleDC(IntPtr dc);
+        [DllImport("gdi32.dll")] public static extern bool DeleteDC(IntPtr dc);
+        [DllImport("gdi32.dll")] public static extern IntPtr SelectObject(IntPtr dc, IntPtr obj);
+        [DllImport("gdi32.dll")] public static extern bool DeleteObject(IntPtr obj);
+        [DllImport("user32.dll")] public static extern bool UpdateLayeredWindow(IntPtr h, IntPtr dst, ref POINT pt, ref SIZE size, IntPtr src, ref POINT srcPt, uint key, ref BLENDFUNCTION blend, uint flags);
+        [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
+        [DllImport("user32.dll")] public static extern IntPtr MonitorFromPoint(POINT p, uint flags);
+        [DllImport("shcore.dll")] public static extern int GetDpiForMonitor(IntPtr mon, int type, out uint dpiX, out uint dpiY);
     }
 
     class Fail : Exception
@@ -202,6 +218,295 @@ namespace ComputerUse
         public string How = "";
     }
 
+    /// The floating agent cursor, as on macOS: a violet arrow that glides to each action's point, gives a
+    /// click a press and a ripple, and stays until hide_cursor (or phantom_cursor_idle_ms). It is a
+    /// layered, click-through, never-activated topmost window on its own UI thread, so it neither takes
+    /// focus nor intercepts the user's mouse.
+    static class Phantom
+    {
+        const int BaseSize = 80;   // window size at 96 dpi; the arrow tip (hotspot) is its center
+        static readonly bool Disabled = Environment.GetEnvironmentVariable("COMPUTER_USE_NO_CURSOR") == "1";
+        static readonly object Gate = new object();
+        static readonly Stopwatch Clock = Stopwatch.StartNew();
+        static System.Windows.Forms.Control ui;
+        static Overlay win;
+        static System.Windows.Forms.Timer frameTimer, idleTimer;
+        static Point? last;          // last target, for the glide duration (worker thread)
+        static volatile bool visible;
+
+        // Animation state, touched only on the UI thread.
+        static PointF from, to, cur;
+        static double glideStart, glideMs, alphaFrom, alpha;
+        static double pulseStart = -1, dismissStart, dismissFrom;
+        static bool pulsePending, dismissing;
+        static int idleMs;
+
+        class Overlay : System.Windows.Forms.NativeWindow
+        {
+            public Overlay()
+            {
+                var cp = new System.Windows.Forms.CreateParams();
+                cp.Style = unchecked((int)0x80000000);                  // WS_POPUP
+                cp.ExStyle = 0x80000 | 0x20 | 0x80 | 0x08000000 | 0x8;  // layered, transparent, tool, no-activate, topmost
+                cp.Width = 1;
+                cp.Height = 1;
+                CreateHandle(cp);
+            }
+
+            protected override void WndProc(ref System.Windows.Forms.Message m)
+            {
+                if (m.Msg == 0x84) { m.Result = new IntPtr(-1); return; }   // WM_NCHITTEST -> HTTRANSPARENT
+                if (m.Msg == 0x21) { m.Result = new IntPtr(3); return; }    // WM_MOUSEACTIVATE -> MA_NOACTIVATE
+                base.WndProc(ref m);
+            }
+        }
+
+        static double Now() { return Clock.Elapsed.TotalMilliseconds; }
+
+        static void EnsureStarted()
+        {
+            if (ui != null) return;
+            var ready = new ManualResetEvent(false);
+            var th = new Thread(() =>
+            {
+                var c = new System.Windows.Forms.Control();
+                var unused = c.Handle;   // BeginInvoke needs the handle
+                win = new Overlay();
+                frameTimer = new System.Windows.Forms.Timer { Interval = 15 };
+                frameTimer.Tick += (s, e) => Frame();
+                idleTimer = new System.Windows.Forms.Timer();
+                idleTimer.Tick += (s, e) => { idleTimer.Stop(); BeginDismiss(); };
+                ui = c;
+                ready.Set();
+                System.Windows.Forms.Application.Run();
+            });
+            th.IsBackground = true;
+            th.SetApartmentState(ApartmentState.STA);
+            th.Start();
+            ready.WaitOne();
+        }
+
+        /// Glides the cursor to a screen point. Returns the glide time in ms, so the action can wait
+        /// for the cursor to arrive before it happens.
+        public static int Show(Point p, bool pulse, int idle)
+        {
+            if (Disabled) return 0;
+            EnsureStarted();
+            Point? prev;
+            lock (Gate) { prev = last; last = p; }
+            double dist = prev.HasValue ? Math.Sqrt(Math.Pow(p.X - prev.Value.X, 2) + Math.Pow(p.Y - prev.Value.Y, 2)) / DpiScale(p) : 140;
+            int ms = dist < 10 ? 40 : (int)(Math.Min(0.42, Math.Max(0.20, dist / 1600.0)) * 1000);
+            visible = true;
+            ui.BeginInvoke((Action)(() => Present(p, prev, ms, pulse, idle)));
+            return ms;
+        }
+
+        /// Fades the cursor out. False when it was not showing.
+        public static bool Dismiss()
+        {
+            if (ui == null || !visible) return false;
+            visible = false;
+            ui.BeginInvoke((Action)BeginDismiss);
+            return true;
+        }
+
+        /// Runs a screen copy with the cursor out of the way.
+        public static void HiddenDuring(Action act)
+        {
+            if (ui == null || !visible) { act(); return; }
+            ui.Invoke((Action)(() => N.ShowWindow(win.Handle, 0)));
+            try { act(); }
+            finally { ui.Invoke((Action)(() => { if (visible) N.ShowWindow(win.Handle, 8); })); }   // SW_SHOWNA
+        }
+
+        static void Present(Point p, Point? prev, int ms, bool pulse, int idle)
+        {
+            idleTimer.Stop();
+            idleMs = idle;
+            if (dismissing || alpha <= 0)
+            {
+                // Hidden (or fading out): fade in on the way from the previous point.
+                if (alpha <= 0)
+                {
+                    var s = prev ?? new Point(p.X - 40, p.Y + 40);
+                    cur = new PointF(s.X, s.Y);
+                }
+                dismissing = false;
+            }
+            from = cur;
+            to = new PointF(p.X, p.Y);
+            alphaFrom = alpha;
+            glideStart = Now();
+            glideMs = ms;
+            pulsePending = pulse;
+            frameTimer.Start();
+            Frame();
+        }
+
+        static void BeginDismiss()
+        {
+            if (alpha <= 0) return;
+            idleTimer.Stop();
+            visible = false;
+            dismissing = true;
+            dismissStart = Now();
+            dismissFrom = alpha;
+            glideMs = 0;
+            pulsePending = false;
+            frameTimer.Start();
+        }
+
+        /// cubic-bezier(0.22, 1, 0.36, 1): fast start, soft stop, the macOS curve.
+        static double Ease(double t)
+        {
+            double lo = 0, hi = 1, s = t;
+            for (int i = 0; i < 24; i++)
+            {
+                s = (lo + hi) / 2;
+                if (Bezier(s, 0.22, 0.36) < t) lo = s; else hi = s;
+            }
+            return Bezier(s, 1.0, 1.0);
+        }
+
+        static double Bezier(double s, double a, double b)
+        {
+            double u = 1 - s;
+            return 3 * u * u * s * a + 3 * u * s * s * b + s * s * s;
+        }
+
+        static void Frame()
+        {
+            double now = Now();
+            bool busy = false;
+            if (glideMs > 0)
+            {
+                double t = Math.Min(1, (now - glideStart) / glideMs);
+                double k = Ease(t);
+                cur = new PointF((float)(from.X + (to.X - from.X) * k), (float)(from.Y + (to.Y - from.Y) * k));
+                alpha = alphaFrom + (1 - alphaFrom) * k;
+                if (t >= 1)
+                {
+                    glideMs = 0;
+                    if (pulsePending) { pulsePending = false; pulseStart = now; }
+                    if (idleMs > 0) { idleTimer.Interval = idleMs; idleTimer.Start(); }
+                }
+                busy = true;
+            }
+            double ringT = -1, press = 1;
+            if (pulseStart >= 0)
+            {
+                double pt = now - pulseStart;
+                if (pt < 340) { ringT = pt / 340; busy = true; } else pulseStart = -1;
+                if (pt < 220)
+                {
+                    double u = pt / 220;
+                    press = u < 0.38 ? 1 - 0.12 * (u / 0.38) : 0.88 + 0.12 * ((u - 0.38) / 0.62);
+                }
+            }
+            if (dismissing)
+            {
+                double dt = (now - dismissStart) / 350;
+                if (dt >= 1)
+                {
+                    dismissing = false;
+                    alpha = 0;
+                    pulseStart = -1;
+                    N.ShowWindow(win.Handle, 0);
+                    frameTimer.Stop();
+                    return;
+                }
+                alpha = dismissFrom * (1 - dt);
+                busy = true;
+            }
+            try { Render(cur, alpha, ringT, press); } catch { }
+            if (!busy) frameTimer.Stop();
+        }
+
+        static float DpiScale(Point p)
+        {
+            try
+            {
+                IntPtr mon = N.MonitorFromPoint(new N.POINT(p.X, p.Y), 2);
+                uint dx, dy;
+                if (N.GetDpiForMonitor(mon, 0, out dx, out dy) == 0 && dx > 0) return dx / 96f;
+            }
+            catch { }
+            return 1f;
+        }
+
+        static GraphicsPath Arrow()
+        {
+            // Points relative to the tip, y down (the macOS polygon, flipped).
+            var p = new GraphicsPath();
+            p.AddPolygon(new[] {
+                new PointF(0, 0), new PointF(0, 20), new PointF(4.8f, 15.5f), new PointF(8.2f, 23f),
+                new PointF(11.2f, 21.5f), new PointF(7.8f, 14f), new PointF(14f, 14f) });
+            return p;
+        }
+
+        static void Render(PointF at, double a, double ringT, double press)
+        {
+            float scale = DpiScale(Point.Round(at));
+            int size = (int)Math.Ceiling(BaseSize * scale);
+            float hot = size / 2f;
+            using (var bmp = new Bitmap(size, size, PixelFormat.Format32bppArgb))
+            {
+                using (var g = Graphics.FromImage(bmp))
+                {
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    g.Clear(Color.Transparent);
+                    g.TranslateTransform(hot, hot);
+                    g.ScaleTransform(scale, scale);
+                    if (ringT >= 0)
+                    {
+                        // Ripple: grows from 0.35 to 1.55 of 19 px while it fades.
+                        double e = 1 - (1 - ringT) * (1 - ringT);
+                        float r = (float)(19 * (0.35 + 1.2 * e));
+                        double fade = 1 - ringT;
+                        using (var b = new SolidBrush(Color.FromArgb((int)(64 * fade), 97, 112, 250))) g.FillEllipse(b, -r, -r, 2 * r, 2 * r);
+                        using (var pen = new Pen(Color.FromArgb((int)(235 * fade), 122, 140, 255), 2.5f)) g.DrawEllipse(pen, -r, -r, 2 * r, 2 * r);
+                    }
+                    g.ScaleTransform((float)press, (float)press);
+                    using (var path = Arrow())
+                    {
+                        // Soft shadow: wide, faint strokes slightly below the arrow.
+                        g.TranslateTransform(0, 1.5f);
+                        for (int i = 4; i >= 1; i--)
+                            using (var sp = new Pen(Color.FromArgb(24, 0, 0, 0), 2.4f + i * 2.2f) { LineJoin = LineJoin.Round }) g.DrawPath(sp, path);
+                        g.TranslateTransform(0, -1.5f);
+                        using (var fill = new SolidBrush(Color.FromArgb(245, 97, 112, 250))) g.FillPath(fill, path);
+                        using (var pen = new Pen(Color.White, 2.4f) { LineJoin = LineJoin.Round }) g.DrawPath(pen, path);
+                    }
+                }
+                Push(bmp, new Point((int)Math.Round(at.X - hot), (int)Math.Round(at.Y - hot)), (byte)Math.Round(255 * Math.Max(0, Math.Min(1, a))));
+            }
+        }
+
+        static void Push(Bitmap bmp, Point dst, byte opacity)
+        {
+            IntPtr h = win.Handle;
+            IntPtr screen = N.GetDC(IntPtr.Zero), mem = N.CreateCompatibleDC(screen);
+            IntPtr hb = bmp.GetHbitmap(Color.FromArgb(0)), old = N.SelectObject(mem, hb);
+            try
+            {
+                var size = new N.SIZE { cx = bmp.Width, cy = bmp.Height };
+                var src = new N.POINT(0, 0);
+                var pt = new N.POINT(dst.X, dst.Y);
+                var blend = new N.BLENDFUNCTION { BlendOp = 0, BlendFlags = 0, SourceConstantAlpha = opacity, AlphaFormat = 1 };
+                N.UpdateLayeredWindow(h, screen, ref pt, ref size, mem, ref src, 0, ref blend, 2);   // ULW_ALPHA
+                // Stay above other topmost windows, never activated: HWND_TOPMOST, NOSIZE|NOMOVE|NOACTIVATE|SHOWWINDOW.
+                N.SetWindowPos(h, new IntPtr(-1), 0, 0, 0, 0, 0x1 | 0x2 | 0x10 | 0x40);
+            }
+            finally
+            {
+                N.SelectObject(mem, old);
+                N.DeleteObject(hb);
+                N.DeleteDC(mem);
+                N.ReleaseDC(IntPtr.Zero, screen);
+            }
+        }
+    }
+
     static class Program
     {
         const string Version = "0.2.0";
@@ -222,6 +527,11 @@ namespace ComputerUse
         {
             try { if (!N.SetProcessDpiAwarenessContext(new IntPtr(-4))) N.SetProcessDPIAware(); }
             catch (EntryPointNotFoundException) { N.SetProcessDPIAware(); }
+            if (argv.Length == 2 && argv[0] == "--foreground")
+                return N.SetForegroundWindow(new IntPtr(long.Parse(argv[1]))) ? 0 : 1;
+            // AttachThreadInput (modifier key state, giving focus back) needs this thread to have an
+            // input queue, which a console thread only gets as a GUI thread.
+            N.IsGUIThread(true);
             SelfElevated = IsElevated(Process.GetCurrentProcess().Id) == true;
             TreeCR = MakeCacheRequest(TreeScope.Element | TreeScope.Children);
             ElementCR = MakeCacheRequest(TreeScope.Element);
@@ -282,6 +592,7 @@ namespace ComputerUse
                 case "menu": return OpMenu(a);
                 case "zoom": return OpZoom(a);
                 case "open": return OpOpen(a);
+                case "hide_cursor": return O("shown", Phantom.Dismiss());
                 case "debug_tree":
                     {
                         var w = WindowFor(a);
@@ -741,7 +1052,7 @@ namespace ComputerUse
                     // front, the screen pixels are the window, so they can be copied instead.
                     if (N.GetForegroundWindow() == w.H && !w.Minimized)
                     {
-                        using (var g = Graphics.FromImage(shot)) g.CopyFromScreen(w.R.X, w.R.Y, 0, 0, w.R.Size);
+                        Phantom.HiddenDuring(() => { using (var g = Graphics.FromImage(shot)) g.CopyFromScreen(w.R.X, w.R.Y, 0, 0, w.R.Size); });
                         method = "screen";
                     }
                     else method = "blank";
@@ -1046,6 +1357,14 @@ namespace ComputerUse
         {
             s = (s ?? "").Replace("\r", "").Replace("\n", " ");
             return s.Length > n ? s.Substring(0, n) + "…" : s;
+        }
+
+        /// Shows the phantom cursor at the target and, for actions that wait, lets it arrive first.
+        static void CursorTo(Dictionary<string, object> a, Target t, bool pulse, int maxWaitMs, double factor)
+        {
+            if (!t.HasPoint) return;
+            int ms = Phantom.Show(t.P, pulse, (int)(Num(Get(a, "cursorIdleMs")) ?? 0));
+            if (ms > 40 && maxWaitMs > 0) Thread.Sleep(Math.Min(maxWaitMs, (int)(ms * factor)));
         }
 
         static void CheckElevation(Win w)
@@ -1455,6 +1774,8 @@ namespace ComputerUse
             var mods = ParseMods(Get(a, "modifiers"));
             var t = Resolve(a, w, true);
             string name = NameOf(t);
+            CursorTo(a, t, true, 220, 0.85);
+            IntPtr fgBefore = N.GetForegroundWindow();
             var before = SnapOf(w);
             var popupsBefore = new HashSet<long>(TopWindows(w.Pid, true).Select(x => x.H.ToInt64()));
 
@@ -1505,8 +1826,44 @@ namespace ComputerUse
                 }
             }
             AppendChanges(w, before, popupsBefore, res);
-            res["point"] = t.HasPoint ? new List<object> { t.P.X - w.R.X, t.P.Y - w.R.Y } : null;
+            KeepForeground(fgBefore, w);
+            res["point"] =t.HasPoint ? new List<object> { t.P.X - w.R.X, t.P.Y - w.R.Y } : null;
             return res;
+        }
+
+        /// Some apps bring themselves to the front when a control is invoked (UWP apps such as the
+        /// Calculator do on every button). When an action did that, the user's window gets the focus back:
+        /// attaching to the thread that now has the foreground is what lets this process set it.
+        static void KeepForeground(IntPtr fgBefore, Win w)
+        {
+            IntPtr now = N.GetForegroundWindow();
+            if (fgBefore == IntPtr.Zero || now == fgBefore || fgBefore == w.H || !N.IsWindow(fgBefore)) return;
+            if (now != w.H && N.GetAncestor(now, N.GA_ROOT) != w.H && PidOf(now) != w.Pid) return;
+            uint me = N.GetCurrentThreadId();
+            // UWP frames belong to ApplicationFrameHost, whose thread refuses to be attached; the
+            // app's own CoreWindow thread shares its input state and accepts it.
+            var tids = new List<uint>();
+            if (ClassOf(now) == "ApplicationFrameWindow") { var core = CoreWindowOf(now); if (core != IntPtr.Zero) tids.Add(TidOf(core)); }
+            tids.Add(TidOf(now));
+            foreach (var tid in tids)
+            {
+                if (tid == 0 || tid == me || !N.AttachThreadInput(me, tid, true)) continue;
+                bool ok;
+                try { ok = N.SetForegroundWindow(fgBefore); }
+                finally { N.AttachThreadInput(me, tid, false); }
+                if (Debug) Console.Error.WriteLine("KeepForeground: tid=" + tid + " set=" + ok + " now=" + N.GetForegroundWindow());
+                if (ok && N.GetForegroundWindow() == fgBefore) return;
+            }
+            // A long-running process loses the right to set the foreground; a freshly started one still
+            // has it, so a short-lived copy of this exe hands the focus back.
+            try
+            {
+                var psi = new ProcessStartInfo(Process.GetCurrentProcess().MainModule.FileName, "--foreground " + fgBefore.ToInt64())
+                { UseShellExecute = false, CreateNoWindow = true };
+                using (var p = Process.Start(psi)) p.WaitForExit(1500);
+            }
+            catch { }
+            if (Debug) Console.Error.WriteLine("KeepForeground: helper, now=" + N.GetForegroundWindow());
         }
 
         /// After an action, report what opened: new elements in the window (a dropdown, an expanded
@@ -1562,6 +1919,7 @@ namespace ComputerUse
             if (t.How == "last" && (t.E == null || !TextKinds.Contains(t.E.Kind))) t = FocusedTarget(w);
             string name = NameOf(t);
             int chars = text.Length;
+            CursorTo(a, t, false, 0, 0);
 
             if (t.E != null)
             {
@@ -1736,6 +2094,7 @@ namespace ComputerUse
                 var p = new Point(w.R.X + w.R.Width / 2, w.R.Y + w.R.Height / 2);
                 t = new Target { W = w, P = p, HasPoint = true, E = HitTest(w, p), How = "center" };
             }
+            CursorTo(a, t, false, 160, 0.8);
 
             // The scrollable element that contains the target.
             El area = null;
@@ -1807,6 +2166,7 @@ namespace ComputerUse
             if (toArgs.Count == 1) throw new Fail("drag needs to ([x, y]) or to_element_index");
             var to = Resolve(toArgs, w, false);
             if (!from.HasPoint || !to.HasPoint) return Result("unsupported", "start or end has no position on screen; give both as coordinates");
+            CursorTo(a, from, true, 180, 0.8);
 
             IntPtr h = DeepChild(w.H, from.P);
             Func<Point, IntPtr> lp = p => { var pt = new N.POINT(p.X, p.Y); N.ScreenToClient(h, ref pt); return N.MakeLParam(pt.X, pt.Y); };
@@ -1826,6 +2186,7 @@ namespace ComputerUse
                 }
                 N.PostMessage(h, N.WM_LBUTTONUP, new IntPtr(mf), lp(to.P));
             });
+            CursorTo(a, to, true, 220, 0.85);
             return Result("ok", "dragged (" + (from.P.X - w.R.X) + "," + (from.P.Y - w.R.Y) + ") -> (" + (to.P.X - w.R.X) + "," + (to.P.Y - w.R.Y)
                 + ") via background mouse events; drags are the least reliable in the background, take a screenshot to confirm");
         }
@@ -1839,7 +2200,9 @@ namespace ComputerUse
             var path = (Strs(Get(a, "path")) ?? new string[0]).Select(s => s.Trim()).Where(s => s.Length > 0).ToList();
             bool listOnly = Bool(Get(a, "list"));
             if (N.GetMenu(w.H) != IntPtr.Zero) return ClassicMenu(w, path, listOnly);
-            return UiaMenu(w, path, listOnly);
+            IntPtr fgBefore = N.GetForegroundWindow();
+            try { return UiaMenu(w, path, listOnly); }
+            finally { Thread.Sleep(80); KeepForeground(fgBefore, w); }
         }
 
         static object ClassicMenu(Win w, List<string> path, bool listOnly)

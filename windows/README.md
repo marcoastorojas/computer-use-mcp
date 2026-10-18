@@ -71,7 +71,7 @@ Configuración (`SystemSettings`), UAC (`consent`), pantallas de credenciales.
 | `ax_budget_ms` | `400` | Tiempo máximo para recorrer el árbol de UI Automation. |
 | `jpeg_quality` | `0.8` | Calidad del JPEG del screenshot. |
 | `max_image_edge` | `1600` | Lado máximo de la imagen (se reescala; las coordenadas no cambian). |
-| `phantom_cursor_idle_ms` | `0` | Sin efecto en Windows (no se dibuja cursor flotante). |
+| `phantom_cursor_idle_ms` | `0` | 0 = el cursor fantasma no se oculta solo; > 0 = ms de inactividad antes de ocultarlo. |
 
 Variables de entorno:
 
@@ -79,7 +79,8 @@ Variables de entorno:
 |---|---|
 | `COMPUTER_USE_CONFIG` | Ruta a `config.json`. |
 | `COMPUTER_USE_WORKER_EXE` | Usar otro `cu-worker.exe` (uso avanzado). |
-| `COMPUTER_USE_DEBUG` | `1` = el worker registra el recorrido del árbol (diagnóstico). |
+| `COMPUTER_USE_NO_CURSOR` | `1` = no dibujar el cursor fantasma. |
+| `COMPUTER_USE_DEBUG` | `1` = el worker escribe diagnósticos en stderr. |
 
 ## Cómo actúa
 
@@ -91,6 +92,17 @@ Variables de entorno:
 | `key` | Atajos de edición en controles Edit/RichEdit como mensajes exactos (`ctrl+a/c/x/v/z`, `ctrl+home/end`); atajos de la barra de menús clásica ejecutan su comando; el resto, teclas de fondo con los modificadores en el estado del hilo de la app. `cmd` equivale a `ctrl`. |
 | `scroll` | ScrollPattern (informa la posición nueva, 0–1); si no, rueda de fondo. |
 | `menu` | Menús clásicos (HMENU) sin abrirlos en pantalla; menús WinUI/WPF por UI Automation (se abren un instante y se cierran). |
+| `hide_cursor` | Desvanece el cursor fantasma. |
+
+**Cursor fantasma**, como en macOS: una flecha violeta con borde blanco que se desliza hasta el
+punto de cada `click`, `type`, `scroll` y `drag`; en los clics y arrastres hace una pequeña
+pulsación con onda. Se queda visible toda la tarea hasta `hide_cursor` (o
+`phantom_cursor_idle_ms`). Es una ventana transparente a los clics que nunca se activa: no roba
+el foco, no tapa tu ratón y no sale en los screenshots de las ventanas.
+
+**Foco:** si una app se pone delante sola al accionar un control (las apps UWP como la
+Calculadora lo hacen en cada botón), el foco vuelve a la ventana que tenías; la app puede
+asomar un instante.
 
 ## Limitaciones
 
@@ -106,7 +118,6 @@ Variables de entorno:
   `list_apps` las marca y las acciones lo explican; ejecuta el cliente MCP como administrador si
   necesitas controlarlas.
 - `drag` en segundo plano es lo menos fiable: confírmalo con un `screenshot`.
-- `hide_cursor` no hace nada (no hay cursor fantasma en Windows).
 - Las coordenadas son píxeles físicos de la ventana (el proceso es *per-monitor DPI aware*).
 
 ## Arquitectura
@@ -117,7 +128,7 @@ src/tools.ts       Las 14 herramientas: sesiones por app, objetivos, formato de 
 src/config.ts      allowed_apps, alias y apps siempre bloqueadas.
 src/worker.ts      Lanza el worker y habla con él (una línea JSON por mensaje); lo reinicia si muere o se cuelga.
 src/native.ts      Compila native/Worker.cs con el csc.exe de .NET Framework.
-native/Worker.cs   Worker nativo: UI Automation con CacheRequest, captura, ratón/teclado de fondo, menús.
+native/Worker.cs   Worker nativo: UI Automation con CacheRequest, captura, ratón/teclado de fondo, menús, cursor fantasma.
 ```
 
 ## Licencia

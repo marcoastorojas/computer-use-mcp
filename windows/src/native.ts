@@ -33,6 +33,7 @@ export function ensureWorkerExe(force = false): string {
     path.join(fw, "WPF", "UIAutomationTypes.dll"),
     path.join(fw, "WPF", "WindowsBase.dll"),
     path.join(fw, "System.Drawing.dll"),
+    path.join(fw, "System.Windows.Forms.dll"),
     path.join(fw, "System.Web.Extensions.dll"),
     path.join(fw, "System.Core.dll"),
   ];
