@@ -1,0 +1,24 @@
+{
+  "allowed_apps": [
+    "Finder",
+    "TextEdit",
+    "Notes",
+    "Preview",
+    "Calculator",
+    "Reminders",
+    "Calendar",
+    "Numbers",
+    "Pages",
+    "Keynote",
+    "Maps",
+    "Music",
+    "Photos",
+    "Microsoft Teams",
+    "com.microsoft.teams2"
+  ],
+  "max_elements": 60,
+  "ax_budget_ms": 150,
+  "jpeg_quality": 0.8,
+  "max_image_edge": 1600,
+  "phantom_cursor_idle_ms": 60000
+}
