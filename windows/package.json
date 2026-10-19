@@ -1,0 +1,23 @@
+{
+  "name": "computer-use-mcp-windows",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Windows backend for computer-use-mcp: model-agnostic MCP server (stdio) that controls Windows desktop apps through UI Automation, window capture and background input.",
+  "type": "commonjs",
+  "bin": {
+    "computer-use-mcp-windows": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node dist/native.js",
+    "start": "node dist/index.js",
+    "doctor": "node dist/index.js --doctor",
+    "test": "node scripts/test_stdio.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.0"
+  }
+}

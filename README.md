@@ -4,6 +4,30 @@ Servidor **MCP (stdio)** nativo en **Swift** para que un agente controle apps de
 
 Agnóstico al modelo/IDE: funciona con cualquier cliente MCP.
 
+## Windows
+
+El repositorio incluye un **backend para Windows** en `windows/` (Node.js + un worker nativo en C# que se compila solo, sin SDK) con las mismas 14 herramientas y el mismo formato de resultados: **UI Automation**, captura con **PrintWindow** e input de fondo por mensajes de ventana. Requisitos, compilación, configuración y limitaciones en [`windows/README.md`](windows/README.md).
+
+## Un solo registro MCP para macOS y Windows
+
+`bin/computer-use-mcp.js` arranca el backend que toca según el sistema (el binario Swift en macOS, `windows/` en Windows) y, si no defines `COMPUTER_USE_CONFIG`, usa el `config.json` de cada sistema (`config.json` en macOS, `windows/config.json` en Windows). Así la entrada del cliente MCP es la misma en las dos máquinas; solo cambia la ruta al repo:
+
+```jsonc
+{
+  "mcp": {
+    "computer-use": {
+      "type": "local",
+      "command": ["node", "/ruta/a/computer-use-mcp/bin/computer-use-mcp.js"],
+      "enabled": true
+    }
+  }
+}
+```
+
+Necesita Node.js en las dos máquinas. En macOS puedes seguir registrando el binario directamente como se explica abajo si prefieres no depender de Node.
+
+El resto de este README describe el backend de macOS.
+
 ## Compilar
 
 ```bash
